@@ -1,0 +1,13 @@
+shalini@shalini-VirtualBox:~/Desktop/work/tools/openlane_working_dir/openlane/designs/picorv32a/runs$ cd runs
+
+shalini@shalini-VirtualBox:~/Desktop/work/tools/openlane_working_dir/openlane/designs/picorv32a/runs$ ls -ltr
+total 8
+drwxr-xr-x 6 shalini shalini 4096 Sep 15 00:04 14-09_18-36/
+drwxr-xr-x 6 shalini shalini 4096 Sep 15 00:08 14-09_18-04/
+
+shalini@shalini-VirtualBox:~/Desktop/work/tools/openlane_working_dir/openlane/designs/picorv32a/runs$ cd 14-09_18-36/results/floorplan/
+
+shalini@shalini-VirtualBox:~/Desktop/work/tools/openlane_working_dir/openlane/designs/picorv32a/runs/14-09_18-36/results/floorplan$ ls
+picorv32a.floorplan.def
+
+shalini@shalini-VirtualBox:~/Desktop/work/tools/openlane_working_dir/openlane/designs/picorv32a/runs/14-09_18-36/results/floorplan$ magic -T /home/shalini/Desktop/work/tools/openlane_working_dir/pdks/sky130A/libs.tech/magic/sky130A.tech lef read ../../tmp/merged.lef def read picorv32a.floorplan.def &
