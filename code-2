@@ -1,0 +1,164 @@
+# ================================
+# 0. SETUP — Go to OpenLANE folder
+# ================================
+cd /home/shalini/Desktop/work/tools/openlane_working_dir/openlane
+
+
+# ================================
+# 1. SYNTHESIS
+# ================================
+./flow.tcl -interactive
+package require openlane 0.9
+prep -design picorv32a
+run_synthesis
+exit
+exit
+
+
+# ================================
+# 2. FLOORPLAN
+# ================================
+./flow.tcl -interactive
+package require openlane 0.9
+prep -design picorv32a
+run_floorplan
+exit
+
+# View Floorplan in Magic
+cd /home/shalini/Desktop/work/tools/openlane_working_dir/openlane/designs/picorv32a/runs/13-11_18-49/results/floorplan/
+magic -T /home/shalini/Desktop/work/tools/openlane_working_dir/pdks/sky130A/libs.tech/magic/sky130A.tech \
+      lef read ../../tmp/merged.lef \
+      def read picorv32a.floorplan.def &
+
+
+# ================================
+# 3. PLACEMENT
+# ================================
+./flow.tcl -interactive
+package require openlane 0.9
+prep -design picorv32a
+run_placement
+exit
+
+# View Placement in Magic
+cd /home/shalini/Desktop/work/tools/openlane_working_dir/openlane/designs/picorv32a/runs/13-11_18-49/results/placement/
+magic -T /home/shalini/Desktop/work/tools/openlane_working_dir/pdks/sky130A/libs.tech/magic/sky130A.tech \
+      lef read ../../tmp/merged.lef \
+      def read picorv32a.placement.def &
+
+
+# ================================
+# 4. CUSTOM INVERTER (Magic)
+# ================================
+cd /home/shalini/Desktop/work/tools/openlane_working_dir/openlane
+git clone https://github.com/nickson-jose/vsdstdcelldesign
+cd vsdstdcelldesign
+cp /home/shalini/Desktop/work/tools/openlane_working_dir/pdks/sky130A/libs.tech/magic/sky130A.tech .
+magic -T sky130A.tech sky130_inv.mag &
+
+# Extraction inside magic (tkcon):
+# extract all
+# ext2spice cthresh 0 rthresh 0
+# ext2spice
+
+
+# ================================
+# 5. CLOCK TREE SYNTHESIS (CTS)
+# ================================
+./flow.tcl -interactive
+package require openlane 0.9
+prep -design picorv32a
+run_synthesis
+run_floorplan
+run_placement
+run_cts
+exit
+
+# OpenROAD Timing Analysis After CTS
+openroad
+read_lef /openLANE_flow/designs/picorv32a/runs/13-11_18-49/tmp/merged.lef
+read_def /openLANE_flow/designs/picorv32a/runs/13-11_18-49/results/cts/picorv32a.cts.def
+write_db pico_cts.db
+read_db pico_cts.db
+read_verilog /openLANE_flow/designs/picorv32a/runs/13-11_18-49/results/synthesis/picorv32a.synthesis_cts.v
+read_liberty $::env(LIB_SYNTH_COMPLETE)
+link_design picorv32a
+read_sdc /openLANE_flow/designs/picorv32a/src/my_base.sdc
+set_propagated_clock [all_clocks]
+report_checks -path_delay min_max -fields {slew trans net cap input_pins} -format full_clock_expanded -digits 4
+exit
+
+
+# ================================
+# 6. POWER DISTRIBUTION NETWORK (PDN)
+# ================================
+./flow.tcl -interactive
+package require openlane 0.9
+prep -design picorv32a
+
+set lefs [glob $::env(DESIGN_DIR)/src/*.lef]
+add_lefs -src $lefs
+
+set ::env(SYNTH_STRATEGY) "DELAY 3"
+set ::env(SYNTH_SIZING) 1
+
+run_synthesis
+run_floorplan
+run_placement
+
+unset ::env(LIB_CTS)
+run_cts
+
+gen_pdn
+exit
+
+
+# ================================
+# 7. ROUTING
+# ================================
+./flow.tcl -interactive
+package require openlane 0.9
+prep -design picorv32a
+
+run_synthesis
+run_floorplan
+run_placement
+run_cts
+gen_pdn
+
+run_routing
+exit
+
+
+# ================================
+# 8. SPEF EXTRACTION (POST-ROUTE)
+# ================================
+cd /home/shalini/Desktop/work/tools/SPEF_EXTRACTOR
+
+python3 main.py \
+  /home/shalini/Desktop/work/tools/openlane_working_dir/openlane/designs/picorv32a/runs/13-11_18-49/tmp/merged.lef \
+  /home/shalini/Desktop/work/tools/openlane_working_dir/openlane/designs/picorv32a/runs/13-11_18-49/results/routing/picorv32a.def
+
+
+# ================================
+# 9. POST-ROUTE TIMING (OpenROAD)
+# ================================
+openroad
+
+read_lef /openLANE_flow/designs/picorv32a/runs/13-11_18-49/tmp/merged.lef
+read_def /openLANE_flow/designs/picorv32a/runs/13-11_18-49/results/routing/picorv32a.def
+
+write_db pico_route.db
+read_db pico_route.db
+
+read_verilog /openLANE_flow/designs/picorv32a/runs/13-11_18-49/results/synthesis/picorv32a.synthesis_preroute.v
+read_liberty $::env(LIB_SYNTH_COMPLETE)
+link_design picorv32a
+
+read_sdc /openLANE_flow/designs/picorv32a/src/my_base.sdc
+set_propagated_clock [all_clocks]
+
+read_spef /openLANE_flow/designs/picorv32a/runs/13-11_18-49/results/routing/picorv32a.spef
+
+report_checks -path_delay min_max -fields {slew trans net cap input_pins} -format full_clock_expanded -digits 4
+exit
