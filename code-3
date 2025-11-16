@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# full_flow.sh
+# Complete, cleaned and finished automation of the OpenLANE -> Magic -> OpenROAD -> SPEF -> GDS flow
+# for user "shalini".
+#
+# Usage:
+#   chmod +x full_flow.sh
+#   ./full_flow.sh
+#
+# Notes/assumptions:
+# - openlane flow.tcl is invoked from the openlane directory.
+# - magic, openroad and python3 are available in PATH.
+# - If OpenROAD CLI flags differ on your system, run the generated TCL files interactively (see messages).
+# - Adjust RUN_TAG if you want a different run directory (default set below).
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- configuration ----------
+USER_HOME="/home/shalini"
+OPENLANE_ROOT="$USER_HOME/Desktop/work/tools/openlane_working_dir/openlane"
+PDK_TECH="$USER_HOME/Desktop/work/tools/openlane_working_dir/pdks/sky130A/libs.tech/magic/sky130A.tech"
+SPEF_EXTRACTOR="$USER_HOME/Desktop/work/tools/SPEF_EXTRACTOR"
+DESIGN="picorv32a"
+RUN_TAG_DEFAULT="13-11_18-49"
+RUN_TAG="${RUN_TAG:-$RUN_TAG_DEFAULT}"
+
+BASE="$OPENLANE_ROOT/designs/$DESIGN/runs/$RUN_TAG"
+FINAL="$BASE/results/final"
+ROUTING_DIR="$BASE/results/routing"
+FLOORPLAN_DIR="$BASE/results/floorplan"
+PLACEMENT_DIR="$BASE/results/placement"
+TMP_LEF="$BASE/tmp/merged.lef"
+PDK_MAGIC="$PDK_TECH"
+
+# ---------- sanity checks ----------
+echo "== Sanity checks =="
+command -v magic >/dev/null 2>&1 || echo "Warning: 'magic' not found in PATH — Magic steps may fail."
+command -v openroad >/dev/null 2>&1 || echo "Warning: 'openroad' not found in PATH — OpenROAD timing steps may fail."
+command -v python3 >/dev/null 2>&1 || { echo "python3 not found in PATH. Exiting."; exit 1; }
+
+mkdir -p "$FINAL"
+
+# ---------- 1) Prepare OpenLANE interactive script (TCL) ----------
+# We'll create a temporary TCL file to feed OpenLANE in interactive mode.
+OL_TCL="$(mktemp --suffix=.tcl)"
+cat > "$OL_TCL" <<'OL_TCL_EOF'
+# Auto-generated OpenLANE TCL commands (non-interactive sequence)
+package require openlane 0.9
+
+# Design
+prep -design picorv32a
+
+# Add custom .lef files from src (if any)
+set lefs [glob $::env(DESIGN_DIR)/src/*.lef]
+if {[llength $lefs] > 0} {
+    add_lefs -src $lefs
+}
+
+# Synthesis settings
+set ::env(SYNTH_STRATEGY) "DELAY 3"
+set ::env(SYNTH_SIZING) 1
+
+run_synthesis
+
+# Floorplan -> Placement -> CTS -> PDN -> Routing
+run_floorplan
+run_placement
+
+unset ::env(LIB_CTS)
+run_cts
+
+gen_pdn
+
+run_routing
+
+# Leave OpenLane interactive session (user can run other steps interactively if desired)
+puts "OpenLANE flow sequence finished (synthesis..routing)."
+OL_TCL_EOF
+
+echo "Created OpenLANE TCL script: $OL_TCL"
+
+# ---------- 2) Run OpenLANE with the generated TCL ----------
+
+echo "== Running OpenLANE main sequence (synthesis -> floorplan -> placement -> cts -> pdn -> routing) =="
+pushd "$OPENLANE_ROOT" >/dev/null
+# Use flow.tcl -interactive and source the temporary TCL file.
+# Some OpenLANE installations accept: ./flow.tcl -file <file> or running interactive then source
+# We'll attempt the interactive sourcing approach.
+./flow.tcl -interactive <<EOF
+source $OL_TCL
+exit
+EOF
+popd >/dev/null
+
+# ---------- 3) Viewers (optional) - open Magic GUI for floorplan / placement / routing (background) ----------
+# We won't block the script for GUI operations but will attempt to launch them in background if available.
+echo "== Attempting to open floorplan/placement/routing DEF in Magic (background, optional) =="
+if command -v magic >/dev/null 2>&1; then
+  if [ -f "$FLOORPLAN_DIR/picorv32a.floorplan.def" ]; then
+    magic -T "$PDK_MAGIC" -dnull -noconsole -noclkgui &>/dev/null & || true
+    # Also attempt to open GUI instances (non-blocking)
+    magic -T "$PDK_MAGIC" lef read "$TMP_LEF" def read "$FLOORPLAN_DIR/picorv32a.floorplan.def" &>/dev/null & || true
+  fi
+  if [ -f "$PLACEMENT_DIR/picorv32a.placement.def" ]; then
+    magic -T "$PDK_MAGIC" lef read "$TMP_LEF" def read "$PLACEMENT_DIR/picorv32a.placement.def" &>/dev/null & || true
+  fi
+  if [ -f "$ROUTING_DIR/picorv32a.def" ]; then
+    magic -T "$PDK_MAGIC" lef read "$TMP_LEF" def read "$ROUTING_DIR/picorv32a.def" &>/dev/null & || true
+  fi
+else
+  echo "magic not found; skipping GUI preview."
+fi
+
+# ---------- 4) SPEF extraction ----------
+if [ -d "$SPEF_EXTRACTOR" ]; then
+  echo "== Running SPEF extractor =="
+  if [ -f "$TMP_LEF" ] && [ -f "$ROUTING_DIR/picorv32a.def" ]; then
+    pushd "$SPEF_EXTRACTOR" >/dev/null
+    # run the user's SPEF extractor script
+    python3 main.py "$TMP_LEF" "$ROUTING_DIR/picorv32a.def" || echo "SPEF extraction script returned non-zero status (continue)."
+    popd >/dev/null
+  else
+    echo "SPEF extraction skipped: merged.lef or routing def missing."
+  fi
+else
+  echo "SPEF extractor folder missing ($SPEF_EXTRACTOR). Skipping SPEF extraction."
+fi
+
+# ---------- 5) Generate DEF -> GDS and DRC with Magic (batch) ----------
+echo "== Running Magic in batch to convert DEF -> GDS and run DRC =="
+if [ -d "$ROUTING_DIR" ]; then
+  pushd "$ROUTING_DIR" >/dev/null
+
+  # Create batch magic script
+  MAGIC_SCRIPT="$(mktemp --suffix=.magic)"
+  cat > "$MAGIC_SCRIPT" <<MAGIC_EOF
+tech load $PDK_MAGIC
+lef read ../../tmp/merged.lef
+def read picorv32a.def
+gds write picorv32a.final.gds
+drc check
+drc report picorv32a.drc.rpt
+quit -noprompt
+MAGIC_EOF
+
+  # Run Magic in batch. We try non-gui mode first.
+  if command -v magic >/dev/null 2>&1; then
+    echo "Running: magic -dnull -noconsole -T \"$PDK_MAGIC\" $MAGIC_SCRIPT"
+    magic -dnull -noconsole -T "$PDK_MAGIC" "$MAGIC_SCRIPT" || echo "Magic batch returned non-zero status (check logs)."
+  else
+    echo "Magic not available in PATH; cannot run batch DEF->GDS conversion."
+  fi
+
+  # move generated files to FINAL (if present)
+  [ -f picorv32a.final.gds ] && mv -f picorv32a.final.gds "$FINAL/" || echo "picorv32a.final.gds not created."
+  [ -f picorv32a.drc.rpt ]   && mv -f picorv32a.drc.rpt "$FINAL/"   || echo "picorv32a.drc.rpt not created."
+
+  # cleanup magic script
+  rm -f "$MAGIC_SCRIPT"
+
+  popd >/dev/null
+else
+  echo "Routing directory ($ROUTING_DIR) missing — skipping DEF->GDS step."
+fi
+
+# ---------- 6) OpenROAD: create and run CTS & post-route timing TCLs ----------
+# We'll generate two TCL files: one for CTS timing report (uses cts.def) and one for post-route timing (uses routed def + spef)
+OPENROAD_CTS_TCL="$(mktemp --suffix=_cts.tcl)"
+cat > "$OPENROAD_CTS_TCL" <<OPENROAD_CTS_EOF
+# OpenROAD CTS timing check script (auto-generated)
+# Adjust paths if necessary
+read_lef $TMP_LEF
+read_def $BASE/results/cts/${DESIGN}.cts.def
+write_db ${DESIGN}_cts.db
+read_db ${DESIGN}_cts.db
+read_verilog $BASE/results/synthesis/${DESIGN}.synthesis_cts.v
+read_liberty \$::env(LIB_SYNTH_COMPLETE)
+link_design ${DESIGN}
+read_sdc $OPENLANE_ROOT/designs/${DESIGN}/src/my_base.sdc
+set_propagated_clock [all_clocks]
+report_checks -path_delay min_max -fields {slew trans net cap input_pins} -format full_clock_expanded -digits 4
+exit
+OPENROAD_CTS_EOF
+
+OPENROAD_POST_TCL="$(mktemp --suffix=_post.tcl)"
+cat > "$OPENROAD_POST_TCL" <<OPENROAD_POST_EOF
+# OpenROAD post-route timing check script (auto-generated)
+read_lef $TMP_LEF
+read_def $ROUTING_DIR/${DESIGN}.def
+write_db ${DESIGN}_route.db
+read_db ${DESIGN}_route.db
+read_verilog $BASE/results/synthesis/${DESIGN}.synthesis_preroute.v
+read_liberty \$::env(LIB_SYNTH_COMPLETE)
+link_design ${DESIGN}
+read_sdc $OPENLANE_ROOT/designs/${DESIGN}/src/my_base.sdc
+set_propagated_clock [all_clocks]
+# read SPEF if produced
+if {[file exists "$ROUTING_DIR/${DESIGN}.spef"]} {
+  read_spef $ROUTING_DIR/${DESIGN}.spef
+}
+report_checks -path_delay min_max -fields {slew trans net cap input_pins} -format full_clock_expanded -digits 4
+exit
+OPENROAD_POST_EOF
+
+# Attempt to run OpenROAD non-interactively using -no_gui -exit -file (common flags). If unavailable, print instructions.
+if command -v openroad >/dev/null 2>&1; then
+  echo "== Running OpenROAD CTS timing (script: $OPENROAD_CTS_TCL) =="
+  # Try a few flag variants — tolerate errors but inform user.
+  if openroad -exit -file "$OPENROAD_CTS_TCL"; then
+    echo "OpenROAD CTS script completed."
+  elif openroad -no_gui -exit -file "$OPENROAD_CTS_TCL"; then
+    echo "OpenROAD CTS script completed (alt flags)."
+  else
+    echo "OpenROAD non-interactive run failed. Run the following interactively:"
+    echo "  openroad"
+    echo "  source $OPENROAD_CTS_TCL"
+  fi
+
+  echo "== Running OpenROAD post-route timing (script: $OPENROAD_POST_TCL) =="
+  if openroad -exit -file "$OPENROAD_POST_TCL"; then
+    echo "OpenROAD post-route script completed."
+  elif openroad -no_gui -exit -file "$OPENROAD_POST_TCL"; then
+    echo "OpenROAD post-route script completed (alt flags)."
+  else
+    echo "OpenROAD non-interactive run failed. Run interactively:"
+    echo "  openroad"
+    echo "  source $OPENROAD_POST_TCL"
+  fi
+else
+  echo "openroad not found; skip OpenROAD timing runs. If you have OpenROAD, run:"
+  echo "  openroad"
+  echo "  source $OPENROAD_CTS_TCL"
+  echo "  source $OPENROAD_POST_TCL"
+fi
+
+# ---------- 7) Collect final artifacts ----------
+echo "== Collecting final artifacts =="
+# Copy relevant files (if present) to final folder
+cp -f "$ROUTING_DIR/${DESIGN}.def"        "$FINAL/" 2>/dev/null || true
+cp -f "$ROUTING_DIR/${DESIGN}.spef"       "$FINAL/" 2>/dev/null || true
+cp -f "$FLOORPLAN_DIR/${DESIGN}.floorplan.def" "$FINAL/" 2>/dev/null || true
+cp -f "$PLACEMENT_DIR/${DESIGN}.placement.def" "$FINAL/" 2>/dev/null || true
+cp -f "$BASE/results/final/${DESIGN}.postroute.v" "$FINAL/" 2>/dev/null || true
+cp -f "$BASE/results/final/pico_route_final.db"   "$FINAL/" 2>/dev/null || true
+
+# Make tarball of results directory
+pushd "$BASE/results" >/dev/null || true
+tar -czvf picorv32a_results_final.tar.gz final routing floorplan placement 2>/dev/null || true
+popd >/dev/null || true
+
+echo
+echo "==== FINISHED ===="
+echo "Final artifacts (if generated) are in: $FINAL"
+echo "Tarball (if created): $BASE/results/picorv32a_results_final.tar.gz"
+echo "OpenLANE TCL file used: $OL_TCL"
+echo "OpenROAD TCL files (cts & post):"
+echo "  $OPENROAD_CTS_TCL"
+echo "  $OPENROAD_POST_TCL"
+echo
+echo "If any step failed due to missing tools or local config, re-run that step interactively and check logs."
